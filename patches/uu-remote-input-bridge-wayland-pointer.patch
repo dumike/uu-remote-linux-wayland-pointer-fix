@@ -1,0 +1,95 @@
+--- a/uu-remote-input-bridge	2026-10-18 08:00:00.000000000 +0800
++++ b/uu-remote-input-bridge	2026-11-02 19:40:36.772145568 +0800
+@@ -437,11 +437,11 @@
+     divides absolute stream positions by the monitor scale: with scaled stage
+     views it expects the physical pixels of the PipeWire buffer.
+     """
+-    width = int(stream["width"])
+-    height = int(stream["height"])
+-    buffer_width = int(stream.get("buffer_width") or width)
+-    buffer_height = int(stream.get("buffer_height") or height)
+-    return x * buffer_width / width, y * buffer_height / height
++    # GNOME 50 / Mutter: NotifyPointerMotionAbsolute bounds-checks the
++    # position against the stream LOGICAL size and expects logical pixels.
++    # The old physical-pixel compensation made the outer band of a 150%
++    # scaled 4K monitor unreachable ("Invalid position"). Pass logical px.
++    return float(x), float(y)
+ 
+ 
+ def x11_monitor_descriptors() -> list[dict[str, Any]]:
+@@ -2787,18 +2787,51 @@
+             if self.last_absolute_pointer == pointer_key and actual_is_target:
+                 self.pointer_motion_suppressed += 1
+                 return
+-            stream_x, stream_y = stream_buffer_point(target, x, y)
+-            self._notify(
+-                "NotifyPointerMotionAbsolute",
+-                "(oa{sv}udd)",
+-                (
+-                    self.session_handle,
+-                    options,
+-                    int(target["node"]),
+-                    stream_x,
+-                    stream_y,
+-                ),
+-            )
++            # Deliver absolute targets as relative deltas with bridge-side
++            # position tracking.  Rationale: xdg-desktop-portal 1.21
++            # check_position() bounds-checks against the stream LOGICAL size
++            # (2560x1440 at 150% scale) while Mutter 50 treats the value as
++            # PHYSICAL pixels (divides by the monitor scale), so no absolute
++            # convention works on fractionally scaled monitors; and X11
++            # XQueryPointer feedback does not follow the portal-driven cursor
++            # outside X11 windows, which made relative deltas diverge to the
++            # top-left corner.  Relative motion itself is unvalidated and
++            # scale-free, so track the logical position here and only send
++            # deltas.  The one-time seed lands at seed/scale by Mutter's own
++            # division, which the tracked position mirrors exactly.
++            tracked = getattr(self, "_tracked_root", None)
++            if tracked is None:
++                width = int(target["width"])
++                height = int(target["height"])
++                scale_x = int(target.get("buffer_width") or width) / width
++                scale_y = int(target.get("buffer_height") or height) / height
++                seed_x, seed_y = 200.0, 200.0
++                self._notify(
++                    "NotifyPointerMotionAbsolute",
++                    "(oa{sv}udd)",
++                    (
++                        self.session_handle,
++                        options,
++                        int(target["node"]),
++                        seed_x,
++                        seed_y,
++                    ),
++                )
++                tracked = (seed_x / scale_x, seed_y / scale_y)
++            delta_x = float(target_root[0]) - tracked[0]
++            delta_y = float(target_root[1]) - tracked[1]
++            if delta_x or delta_y:
++                self._notify(
++                    "NotifyPointerMotion",
++                    "(oa{sv}dd)",
++                    (
++                        self.session_handle,
++                        options,
++                        delta_x,
++                        delta_y,
++                    ),
++                )
++            self._tracked_root = (float(target_root[0]), float(target_root[1]))
+             self.last_absolute_pointer = pointer_key
+             self.pointer_motion_injected += 1
+         else:
+@@ -2819,6 +2852,11 @@
+                 "(oa{sv}dd)",
+                 (self.session_handle, options, float(dx), float(dy)),
+             )
++            if getattr(self, "_tracked_root", None) is not None:
++                self._tracked_root = (
++                    self._tracked_root[0] + float(dx),
++                    self._tracked_root[1] + float(dy),
++                )
+             self.last_absolute_pointer = None
+             self.previous_absolute_request = None
+             self.last_absolute_request = None
